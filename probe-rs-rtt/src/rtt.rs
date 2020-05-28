@@ -44,21 +44,18 @@ impl Rtt {
 
     fn from(
         session: Arc<Mutex<Session>>,
-        memory_map: &[MemoryRegion],
         // Pointer from which to scan
         ptr: u32,
         // Memory contents read in advance, starting from ptr
         mem_in: Option<&[u8]>,
     ) -> Result<Option<Rtt>, Error> {
-        let mut lock = session.lock().unwrap();
-        let mut core = lock.core(0)?;
         let mut mem = match mem_in {
             Some(mem) => Cow::Borrowed(mem),
             None => {
                 // If memory wasn't passed in, read the minimum header size
                 let mut mem = vec![0u8; Self::MIN_SIZE];
 
-                core.read_8(ptr, &mut mem)?;
+                session.lock().unwrap().core(0)?.read_8(ptr, &mut mem)?;
                 Cow::Owned(mem)
             }
         };
@@ -72,7 +69,6 @@ impl Rtt {
         let max_down_channels = mem
             .pread_with::<u32>(Self::O_MAX_DOWN_CHANNELS, LE)
             .unwrap() as usize;
-
         // *Very* conservative sanity check, most people
         if max_up_channels > 255 || max_down_channels > 255 {
             return Err(Error::ControlBlockCorrupted(format!(
@@ -80,22 +76,21 @@ impl Rtt {
                 ptr, max_up_channels, max_down_channels
             )));
         }
-
         let cb_len = Self::O_CHANNEL_ARRAYS + (max_up_channels + max_down_channels) * Channel::SIZE;
 
         if let Cow::Owned(mem) = &mut mem {
             // If memory wasn't passed in, read the rest of the control block
             mem.resize(cb_len, 0);
-            core.read_8(
+            session.lock().unwrap().core(0)?.read_8(
                 ptr + Self::MIN_SIZE as u32,
                 &mut mem[Self::MIN_SIZE..cb_len],
             )?;
         }
-
         // Validate that the entire control block fits within the region
         if mem.len() < cb_len {
             return Ok(None);
         }
+        let memory_map = session.lock().unwrap().memory_map().to_vec();
 
         let mut up_channels = BTreeMap::new();
         let mut down_channels = BTreeMap::new();
@@ -103,9 +98,13 @@ impl Rtt {
         for i in 0..max_up_channels {
             let offset = Self::O_CHANNEL_ARRAYS + i * Channel::SIZE;
 
-            if let Some(chan) =
-                Channel::from(&session, i, memory_map, ptr + offset as u32, &mem[offset..])?
-            {
+            if let Some(chan) = Channel::from(
+                &session,
+                i,
+                &memory_map,
+                ptr + offset as u32,
+                &mem[offset..],
+            )? {
                 up_channels.insert(i, UpChannel(chan));
             }
         }
@@ -114,9 +113,13 @@ impl Rtt {
             let offset =
                 Self::O_CHANNEL_ARRAYS + (max_up_channels * Channel::SIZE) + i * Channel::SIZE;
 
-            if let Some(chan) =
-                Channel::from(&session, i, memory_map, ptr + offset as u32, &mem[offset..])?
-            {
+            if let Some(chan) = Channel::from(
+                &session,
+                i,
+                &memory_map,
+                ptr + offset as u32,
+                &mem[offset..],
+            )? {
                 down_channels.insert(i, DownChannel(chan));
             }
         }
@@ -143,14 +146,14 @@ impl Rtt {
     /// `core` can be e.g. an owned `Core` or a shared `Rc<Core>`. The session is only borrowed
     /// temporarily during detection.
     pub fn attach_region(session: Arc<Mutex<Session>>, region: &ScanRegion) -> Result<Rtt, Error> {
-        let memory_map: &[MemoryRegion] = &session.lock().unwrap().memory_map().to_vec();
-
         let ranges: Vec<Range<u32>> = match region {
             ScanRegion::Exact(addr) => {
-                return Rtt::from(session, memory_map, *addr, None)?
-                    .ok_or(Error::ControlBlockNotFound);
+                return Rtt::from(session, *addr, None)?.ok_or(Error::ControlBlockNotFound);
             }
-            ScanRegion::Ram => memory_map
+            ScanRegion::Ram => session
+                .lock()
+                .unwrap()
+                .memory_map()
                 .iter()
                 .filter_map(|r| match r {
                     MemoryRegion::Ram(r) => Some(r.range.clone()),
@@ -169,14 +172,15 @@ impl Rtt {
             }
 
             mem.resize(range.len(), 0);
-            let mut lock = session.lock().unwrap();
-            let mut core = lock.core(0)?;
-            core.read_8(range.start, mem.as_mut())?;
+            {
+                let mut lock = session.lock().unwrap();
+                let mut core = lock.core(0)?;
+                core.read_8(range.start, mem.as_mut())?;
+            }
 
             for offset in 0..(mem.len() - Self::MIN_SIZE) {
                 if let Some(rtt) = Rtt::from(
                     session.clone(),
-                    memory_map,
                     range.start + offset as u32,
                     Some(&mem[offset..]),
                 )? {
